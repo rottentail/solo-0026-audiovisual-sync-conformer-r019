@@ -31,6 +31,24 @@ The stored digest always describes the exact two payloads. A take identifier is
 unique and may be retried only with the same name, audio bytes, and picture
 bytes.
 
+### Probe resource budgets
+
+The byte-size caps are reinforced by structural budgets at every probe, so a
+format-legal shell cannot make parsing, hashing, or detection cost grow faster
+than the real media it carries:
+
+- a WAV payload is walked only inside its declared RIFF bounds, spans at most
+  64 chunks, and its non-`data` chunk bytes plus trailing bytes beyond the
+  RIFF chunk may not exceed 256 KiB;
+- a Y4M stream header line may not exceed 1024 bytes and each frame header
+  line may not exceed 256 bytes, and header lines are never tokenized beyond
+  those bounds.
+
+Ordinary attached metadata (LIST/INFO, bext, iXML, cue, X-tags, sector
+padding) fits far below these allowances and is admitted. Material that
+exceeds them is rejected with `invalid_audio` or `invalid_video`, and the
+rejection leaves no take record or identifier reservation behind.
+
 ### Sync analysis
 
 A `SyncAnalysis` belongs to one admitted take. It records:

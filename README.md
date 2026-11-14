@@ -181,3 +181,12 @@ The baseline accepts one PCM WAV stream and one C420 Y4M stream per take.
 Compressed audio, compressed picture, multi-stream containers, captions, and
 network storage adapters are intentionally outside this baseline. Their real
 extension seams are recorded in `.task-source.json`.
+
+Probe resource budgets keep parsing and detection cost proportional to the
+real media a payload carries. WAV payloads are walked only inside their
+declared RIFF bounds, span at most 64 chunks, and may carry at most 256 KiB
+of non-`data` chunk and trailing bytes. Y4M stream header lines are limited
+to 1024 bytes and frame header lines to 256 bytes. Ordinary metadata chunks
+and X-tags fit well below these budgets; shells whose structure dwarfs their
+media are rejected with `invalid_audio` or `invalid_video` and leave no take
+record behind.

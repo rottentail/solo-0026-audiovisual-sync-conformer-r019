@@ -33,19 +33,37 @@ func InspectAudio(data []byte) (AudioClip, error) {
 	if riffSize < 4 || riffSize+8 > len(data) {
 		return AudioClip{}, fmt.Errorf("RIFF size does not fit the payload")
 	}
+	riffEnd := riffSize + 8
+	// Bytes beyond the declared RIFF chunk are not part of the media; they
+	// are tolerated only up to the shared metadata budget (sector padding).
+	metadataBytes := len(data) - riffEnd
+	if metadataBytes > domain.MaxWAVMetadataBytes {
+		return AudioClip{}, fmt.Errorf(
+			"WAV trailing bytes exceed the %d byte metadata budget",
+			domain.MaxWAVMetadataBytes,
+		)
+	}
 
 	var format waveFormat
 	var pcm []byte
 	haveFormat := false
+	chunkCount := 0
 	offset := 12
-	for offset < len(data) {
-		if offset+8 > len(data) {
+	for offset < riffEnd {
+		if offset+8 > riffEnd {
 			return AudioClip{}, fmt.Errorf("truncated WAV chunk header")
 		}
 		chunkID := string(data[offset : offset+4])
 		chunkSize := int(binary.LittleEndian.Uint32(data[offset+4 : offset+8]))
-		if chunkSize < 0 || offset+8+chunkSize > len(data) {
-			return AudioClip{}, fmt.Errorf("WAV chunk %q exceeds payload", chunkID)
+		if chunkSize < 0 || offset+8+chunkSize > riffEnd {
+			return AudioClip{}, fmt.Errorf("WAV chunk %q exceeds the RIFF payload", chunkID)
+		}
+		chunkCount++
+		if chunkCount > domain.MaxWAVChunks {
+			return AudioClip{}, fmt.Errorf(
+				"WAV chunk count exceeds the %d chunk limit",
+				domain.MaxWAVChunks,
+			)
 		}
 		body := data[offset+8 : offset+8+chunkSize]
 		switch chunkID {
@@ -64,6 +82,14 @@ func InspectAudio(data []byte) (AudioClip, error) {
 			haveFormat = true
 		case "data":
 			pcm = body
+		default:
+			metadataBytes += 8 + chunkSize + (chunkSize & 1)
+			if metadataBytes > domain.MaxWAVMetadataBytes {
+				return AudioClip{}, fmt.Errorf(
+					"WAV metadata chunks exceed the %d byte budget",
+					domain.MaxWAVMetadataBytes,
+				)
+			}
 		}
 		offset += 8 + chunkSize
 		if chunkSize%2 == 1 {

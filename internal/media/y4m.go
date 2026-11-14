@@ -25,9 +25,12 @@ type parsedHeader struct {
 }
 
 func InspectVideo(data []byte) (VideoClip, error) {
-	lineEnd := bytes.IndexByte(data, '\n')
+	lineEnd := findY4MLineEnd(data, domain.MaxY4MHeaderLineBytes)
 	if lineEnd < 0 {
-		return VideoClip{}, fmt.Errorf("Y4M header line is incomplete")
+		return VideoClip{}, fmt.Errorf(
+			"Y4M header line is missing or exceeds the %d byte limit",
+			domain.MaxY4MHeaderLineBytes,
+		)
 	}
 	header, err := parseY4MHeader(string(data[:lineEnd]))
 	if err != nil {
@@ -40,9 +43,12 @@ func InspectVideo(data []byte) (VideoClip, error) {
 	frames := make([][]byte, 0, 24)
 	cursor := lineEnd + 1
 	for cursor < len(data) {
-		headerEnd := bytes.IndexByte(data[cursor:], '\n')
+		headerEnd := findY4MLineEnd(data[cursor:], domain.MaxY4MFrameHeaderBytes)
 		if headerEnd < 0 {
-			return VideoClip{}, fmt.Errorf("Y4M frame header is incomplete")
+			return VideoClip{}, fmt.Errorf(
+				"Y4M frame header is missing or exceeds the %d byte limit",
+				domain.MaxY4MFrameHeaderBytes,
+			)
 		}
 		headerEnd += cursor
 		frameHeader := string(data[cursor:headerEnd])
@@ -78,6 +84,17 @@ func InspectVideo(data []byte) (VideoClip, error) {
 		ByteCount:  len(data),
 	}
 	return VideoClip{Info: info, Frames: frames}, nil
+}
+
+// findY4MLineEnd locates the newline terminating a Y4M line while scanning at
+// most maxLine+1 bytes, so a header line longer than maxLine is rejected
+// without reading or tokenizing the rest of the payload.
+func findY4MLineEnd(data []byte, maxLine int) int {
+	window := data
+	if len(window) > maxLine+1 {
+		window = window[:maxLine+1]
+	}
+	return bytes.IndexByte(window, '\n')
 }
 
 func parseY4MHeader(line string) (parsedHeader, error) {

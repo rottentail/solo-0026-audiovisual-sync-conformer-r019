@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -24,11 +25,13 @@ import (
 )
 
 type checkContext struct {
-	root   string
-	server *httptest.Server
-	client *http.Client
-	audio  []byte
-	video  []byte
+	root      string
+	server    *httptest.Server
+	client    *http.Client
+	audio     []byte
+	video     []byte
+	metaAudio []byte
+	metaVideo []byte
 }
 
 func main() {
@@ -75,14 +78,21 @@ func newCheckContext() (*checkContext, error) {
 		os.RemoveAll(root)
 		return nil, err
 	}
+	metaAudio, metaVideo, err := metadataPair(audio, video)
+	if err != nil {
+		os.RemoveAll(root)
+		return nil, err
+	}
 	api := httpapi.New(appservice.New(repository))
 	server := httptest.NewServer(api.Handler())
 	return &checkContext{
-		root:   root,
-		server: server,
-		client: &http.Client{Timeout: 20 * time.Second},
-		audio:  audio,
-		video:  video,
+		root:      root,
+		server:    server,
+		client:    &http.Client{Timeout: 20 * time.Second},
+		audio:     audio,
+		video:     video,
+		metaAudio: metaAudio,
+		metaVideo: metaVideo,
 	}, nil
 }
 
@@ -168,12 +178,97 @@ func runAdmitCheck(ctx *checkContext) error {
 	if code := errorCode(body); code != "invalid_audio" {
 		return fmt.Errorf("malformed audio returned code %q", code)
 	}
+
+	// Ordinary attached metadata must not be rejected: the metadata pair
+	// carries LIST/INFO and private chunks, a sector-style trailing pad, and
+	// Y4M X-tags around the same calibration media.
+	response, body, err = ctx.requestJSON(
+		http.MethodPost,
+		"/v1/takes",
+		takePayload("meta-take-01", "metadata take", ctx.metaAudio, ctx.metaVideo),
+	)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusCreated {
+		return fmt.Errorf("metadata take returned %d: %s", response.StatusCode, body)
+	}
+	var metaTake domain.MediaTake
+	if err := json.Unmarshal(body, &metaTake); err != nil {
+		return fmt.Errorf("decode metadata take: %w", err)
+	}
+	if metaTake.Audio.FrameCount != media.CalibrationSampleRate ||
+		metaTake.Video.FrameCount != media.CalibrationFrames {
+		return fmt.Errorf("metadata take descriptors do not match the embedded media")
+	}
+
+	// Format-legal shells whose structure dwarfs their media must be
+	// rejected at admission and must leave no usable record behind.
+	junkAudio, junkVideo, err := structuralShells(ctx.audio, ctx.video)
+	if err != nil {
+		return err
+	}
+	junkCases := []struct {
+		id    string
+		audio []byte
+		video []byte
+		code  string
+	}{
+		{"junk-chunks-01", junkAudio["chunk-storm"], ctx.video, "invalid_audio"},
+		{"junk-meta-01", junkAudio["fat-metadata"], ctx.video, "invalid_audio"},
+		{"junk-trailer-01", junkAudio["fat-trailer"], ctx.video, "invalid_audio"},
+		{"junk-y4m-head-01", ctx.audio, junkVideo["fat-stream-header"], "invalid_video"},
+		{"junk-y4m-frame-01", ctx.audio, junkVideo["fat-frame-header"], "invalid_video"},
+	}
+	for _, junk := range junkCases {
+		response, body, err = ctx.requestJSON(
+			http.MethodPost,
+			"/v1/takes",
+			takePayload(junk.id, "structural shell", junk.audio, junk.video),
+		)
+		if err != nil {
+			return err
+		}
+		if response.StatusCode != http.StatusUnprocessableEntity {
+			return fmt.Errorf("%s returned %d: %s", junk.id, response.StatusCode, body)
+		}
+		if code := errorCode(body); code != junk.code {
+			return fmt.Errorf("%s returned code %q, want %q", junk.id, code, junk.code)
+		}
+		response, body, err = ctx.requestJSON(http.MethodGet, "/v1/takes/"+junk.id, nil)
+		if err != nil {
+			return err
+		}
+		if response.StatusCode != http.StatusNotFound {
+			return fmt.Errorf("%s is readable after rejection: %d %s", junk.id, response.StatusCode, body)
+		}
+	}
+
+	// A failed admission holds no identifier: the same id with valid media
+	// must be admitted rather than conflicting with a phantom record.
+	response, body, err = ctx.requestJSON(
+		http.MethodPost,
+		"/v1/takes",
+		takePayload("junk-chunks-01", "recovered take", ctx.audio, ctx.video),
+	)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusCreated {
+		return fmt.Errorf("identifier reuse after rejection returned %d: %s", response.StatusCode, body)
+	}
+
 	persisted, err := storage.New(ctx.root)
 	if err != nil {
 		return err
 	}
 	if _, err := persisted.GetTake("stable-take-01"); err != nil {
 		return fmt.Errorf("persisted take is unreadable: %w", err)
+	}
+	for _, junk := range junkCases[1:] {
+		if _, err := persisted.GetTake(junk.id); !domain.IsErrorCode(err, "take_not_found") {
+			return fmt.Errorf("rejected take %s left a persisted record", junk.id)
+		}
 	}
 	return nil
 }
@@ -227,11 +322,48 @@ func runAnalyzeCheck(ctx *checkContext) error {
 	if stored.State != domain.AnalysisStateReady || stored.OffsetMS == nil {
 		return fmt.Errorf("persisted analysis is not terminal")
 	}
+
+	// The same measurement must hold for media admitted under ordinary
+	// metadata wrappers: detection runs on the real content, not the shell.
+	if err := admitTakeMedia(ctx, "analysis-take-meta", ctx.metaAudio, ctx.metaVideo); err != nil {
+		return err
+	}
+	response, body, err = ctx.requestJSON(
+		http.MethodPost,
+		"/v1/takes/analysis-take-meta/sync-analyses",
+		map[string]any{
+			"analysis_id":    "analysis-meta-01",
+			"min_confidence": 0.55,
+			"max_offset_ms":  1000,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusCreated {
+		return fmt.Errorf("metadata analysis returned %d: %s", response.StatusCode, body)
+	}
+	var metaAnalysis domain.SyncAnalysis
+	if err := json.Unmarshal(body, &metaAnalysis); err != nil {
+		return fmt.Errorf("decode metadata analysis: %w", err)
+	}
+	if metaAnalysis.State != domain.AnalysisStateReady {
+		return fmt.Errorf("metadata analysis state is %s: %s", metaAnalysis.State, metaAnalysis.ErrorMessage)
+	}
+	if metaAnalysis.OffsetMS == nil || *metaAnalysis.OffsetMS != 125 {
+		return fmt.Errorf("metadata analysis offset is %v, want 125", metaAnalysis.OffsetMS)
+	}
+	if metaAnalysis.AudioEventMS == nil || *metaAnalysis.AudioEventMS != 500 {
+		return fmt.Errorf("metadata audio event is %v, want 500", metaAnalysis.AudioEventMS)
+	}
+	if metaAnalysis.VideoEventMS == nil || *metaAnalysis.VideoEventMS != 375 {
+		return fmt.Errorf("metadata picture event is %v, want 375", metaAnalysis.VideoEventMS)
+	}
 	return nil
 }
 
 func runRenderCheck(ctx *checkContext) error {
-	if err := admitTake(ctx, "conform-take-01"); err != nil {
+	if err := admitTakeMedia(ctx, "conform-take-01", ctx.metaAudio, ctx.metaVideo); err != nil {
 		return err
 	}
 	if err := createAnalysis(ctx, "conform-take-01", "conform-analysis-01"); err != nil {
@@ -319,10 +451,14 @@ func runRenderCheck(ctx *checkContext) error {
 }
 
 func admitTake(ctx *checkContext, id string) error {
+	return admitTakeMedia(ctx, id, ctx.audio, ctx.video)
+}
+
+func admitTakeMedia(ctx *checkContext, id string, audio, video []byte) error {
 	response, body, err := ctx.requestJSON(
 		http.MethodPost,
 		"/v1/takes",
-		takePayload(id, "workflow take", ctx.audio, ctx.video),
+		takePayload(id, "workflow take", audio, video),
 	)
 	if err != nil {
 		return err
@@ -367,6 +503,155 @@ func takePayload(id, name string, audio, video []byte) map[string]any {
 		"audio_base64": base64.StdEncoding.EncodeToString(audio),
 		"video_base64": base64.StdEncoding.EncodeToString(video),
 	}
+}
+
+// metadataPair wraps the calibration media in ordinary attached metadata:
+// LIST/INFO and private WAV chunks plus a sector-style trailing pad, and
+// Y4M X-tags on the stream header and every frame header. The audible and
+// visible content is unchanged, so admission and detection must behave
+// exactly as they do for the plain pair.
+func metadataPair(audio, video []byte) ([]byte, []byte, error) {
+	fmtBody, pcm, err := wavParts(audio)
+	if err != nil {
+		return nil, nil, err
+	}
+	infoBody := append([]byte("INFO"), riffChunk("ISFT", []byte("sync-calibrator"))...)
+	metaAudio := buildWAVPayload([][]byte{
+		riffChunk("fmt ", fmtBody),
+		riffChunk("LIST", infoBody),
+		riffChunk("note", []byte("dual system sound")),
+		riffChunk("data", pcm),
+	}, make([]byte, 128))
+
+	info, frames, err := calibrationY4MParts(video)
+	if err != nil {
+		return nil, nil, err
+	}
+	frameHeaders := make([]string, len(frames))
+	for index := range frameHeaders {
+		frameHeaders[index] = "FRAME XCOLORSPACE=420JPEG"
+	}
+	metaVideo := buildY4MPayload(y4mStreamHeader(info, "XCOLORSPACE=420JPEG"), frameHeaders, frames)
+	return metaAudio, metaVideo, nil
+}
+
+// structuralShells builds format-legal payloads whose structural content
+// dwarfs the actual media. Each variant trips exactly one probe budget.
+func structuralShells(audio, video []byte) (map[string][]byte, map[string][]byte, error) {
+	fmtBody, pcm, err := wavParts(audio)
+	if err != nil {
+		return nil, nil, err
+	}
+	info, frames, err := calibrationY4MParts(video)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	stormChunks := [][]byte{riffChunk("fmt ", fmtBody)}
+	for index := 0; index < 200; index++ {
+		stormChunks = append(stormChunks, riffChunk("JUNK", nil))
+	}
+	stormChunks = append(stormChunks, riffChunk("data", pcm))
+	junkAudio := map[string][]byte{
+		"chunk-storm": buildWAVPayload(stormChunks, nil),
+		"fat-metadata": buildWAVPayload([][]byte{
+			riffChunk("fmt ", fmtBody),
+			riffChunk("JUNK", make([]byte, 300<<10)),
+			riffChunk("data", pcm),
+		}, nil),
+		"fat-trailer": buildWAVPayload([][]byte{
+			riffChunk("fmt ", fmtBody),
+			riffChunk("data", pcm),
+		}, make([]byte, 300<<10)),
+	}
+
+	plainHeaders := make([]string, len(frames))
+	for index := range plainHeaders {
+		plainHeaders[index] = "FRAME"
+	}
+	fatFrameHeaders := make([]string, len(frames))
+	copy(fatFrameHeaders, plainHeaders)
+	fatFrameHeaders[0] = "FRAME X" + strings.Repeat("t", 300)
+	junkVideo := map[string][]byte{
+		"fat-stream-header": buildY4MPayload(
+			y4mStreamHeader(info, "X"+strings.Repeat("a", 2<<10)),
+			plainHeaders,
+			frames,
+		),
+		"fat-frame-header": buildY4MPayload(y4mStreamHeader(info), fatFrameHeaders, frames),
+	}
+	return junkAudio, junkVideo, nil
+}
+
+// wavParts splits a canonical EncodePCM16 payload into its fmt chunk body
+// and PCM data body so the check can reassemble custom RIFF containers.
+func wavParts(audio []byte) ([]byte, []byte, error) {
+	if len(audio) < 44 ||
+		string(audio[0:4]) != "RIFF" ||
+		string(audio[12:16]) != "fmt " ||
+		string(audio[36:40]) != "data" {
+		return nil, nil, fmt.Errorf("calibration audio layout is not canonical")
+	}
+	return audio[20:36], audio[44:], nil
+}
+
+func calibrationY4MParts(video []byte) (domain.VideoInfo, [][]byte, error) {
+	clip, err := media.InspectVideo(video)
+	if err != nil {
+		return domain.VideoInfo{}, nil, fmt.Errorf("probe calibration video: %w", err)
+	}
+	return clip.Info, clip.Frames, nil
+}
+
+func riffChunk(id string, body []byte) []byte {
+	chunk := make([]byte, 8+len(body)+(len(body)&1))
+	copy(chunk[0:4], id)
+	binary.LittleEndian.PutUint32(chunk[4:8], uint32(len(body)))
+	copy(chunk[8:], body)
+	return chunk
+}
+
+func buildWAVPayload(chunks [][]byte, trailing []byte) []byte {
+	var body bytes.Buffer
+	body.WriteString("WAVE")
+	for _, chunk := range chunks {
+		body.Write(chunk)
+	}
+	payload := body.Bytes()
+	out := make([]byte, 0, 8+len(payload)+len(trailing))
+	out = append(out, []byte("RIFF")...)
+	var size [4]byte
+	binary.LittleEndian.PutUint32(size[0:4], uint32(len(payload)))
+	out = append(out, size[:]...)
+	out = append(out, payload...)
+	return append(out, trailing...)
+}
+
+func y4mStreamHeader(info domain.VideoInfo, extraTags ...string) string {
+	header := fmt.Sprintf(
+		"YUV4MPEG2 W%d H%d F%d:%d Ip A0:0 %s",
+		info.Width,
+		info.Height,
+		info.FPSNum,
+		info.FPSDen,
+		info.Chroma,
+	)
+	for _, tag := range extraTags {
+		header += " " + tag
+	}
+	return header
+}
+
+func buildY4MPayload(streamHeader string, frameHeaders []string, frames [][]byte) []byte {
+	var out bytes.Buffer
+	out.WriteString(streamHeader)
+	out.WriteByte('\n')
+	for index, frame := range frames {
+		out.WriteString(frameHeaders[index])
+		out.WriteByte('\n')
+		out.Write(frame)
+	}
+	return out.Bytes()
 }
 
 func (ctx *checkContext) requestJSON(

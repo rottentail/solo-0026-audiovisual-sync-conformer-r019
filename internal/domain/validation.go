@@ -20,6 +20,24 @@ const (
 	MaxCorrectionMS        = 5000
 )
 
+// Probe resource budgets keep parsing, hashing, and detection cost
+// proportional to the real media a payload carries. A format-legal shell
+// must not be able to spend CPU or memory far beyond its audible or visible
+// content, while ordinary metadata (LIST/INFO, bext, iXML, cue, X-tags, and
+// sector padding) stays far below these allowances.
+const (
+	// MaxWAVChunks bounds the top-level RIFF chunks walked per WAV payload.
+	MaxWAVChunks = 64
+	// MaxWAVMetadataBytes bounds the combined size of non-data chunk
+	// headers, bodies, and pad bytes plus any trailing bytes beyond the
+	// declared RIFF chunk.
+	MaxWAVMetadataBytes = 256 << 10
+	// MaxY4MHeaderLineBytes bounds the Y4M stream header line.
+	MaxY4MHeaderLineBytes = 1024
+	// MaxY4MFrameHeaderBytes bounds each Y4M per-frame header line.
+	MaxY4MFrameHeaderBytes = 256
+)
+
 func ValidateCreateTake(input CreateTakeInput) error {
 	if err := ValidateIdentifier("take_id", input.TakeID); err != nil {
 		return err
